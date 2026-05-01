@@ -130,8 +130,7 @@ class LundReweighter():
 
 
             #directory of pt extrapolation fits
-            f_ratio.cd('pt_extrap')
-            self.pt_extrap_dir = ROOT.gDirectory
+            self.pt_extrap_dir = f_ratio.GetDirectory('pt_extrap')
 
 
 

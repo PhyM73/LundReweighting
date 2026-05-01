@@ -1,4 +1,7 @@
 *.pyc
 *.swp
 *.un~
+*.tex
+*.txt
+*.tmp
 old/*

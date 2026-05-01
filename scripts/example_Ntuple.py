@@ -13,6 +13,9 @@ import os
 import math
 import argparse
 from typing import List, Tuple, Dict, Any, Optional
+import uuid
+import shutil
+import concurrent.futures
 
 import numpy as np
 import ROOT
@@ -211,7 +214,6 @@ def process_inputs(
         raise ValueError("Could not locate 'Events' tree in input file.")
 
     inTree = InputTree(TTree)
-    print(f"Total entries available: {TTree.GetEntries()}")
 
     nEvents = 0
     jets_list = []
@@ -219,9 +221,6 @@ def process_inputs(
     cands_list = []
 
     for entry in range(inTree.entries):
-        if entry % 10000 == 0:
-            print(f"--- Processing Event {entry} | Saved {nEvents} jets so far")
-
         event = Event(inTree, entry)
 
         if not apply_selections(inTree, triggers):
@@ -292,113 +291,153 @@ def process_inputs(
 
     return np.array(jets_list), np.array(quarks_list), cands_list
 
+## ==============================================================================
+# 5. Global Distortion (Pass 1)
 # ==============================================================================
-# 5. Weight and Scale Factor Calculation
-# ==============================================================================
 
-def calculate_weights_and_sf(
-    jets: np.ndarray,
-    quarks: np.ndarray,
-    cands: List[List[List[float]]],
-    ratio_file_path: str,
-    tau21_cut: float = 0.4,
-    chunk_size: int = 5000,
-    seed: Optional[int] = None
-) -> Dict[str, Any]:
+def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str]) -> Optional[np.ndarray]:
     """
-    Computes the Lund Plane weights, determines the efficiency of a substructure cut,
-    and estimates Scale Factors (SF) with full uncertainty breakdown.
-
-    Args:
-        jets (np.ndarray): Extracted jets array.
-        quarks (np.ndarray): Extracted gen quarks array.
-        cands (List[List[List[float]]]): PF candidates.
-        ratio_file_path (str): Path to the correction root file.
-        tau21_cut (float): Substructure cut threshold for evaluation.
-
-    Returns:
-        Dict[str, Any]: Mapping of computed metrics and uncertainties.
+    Worker for Pass 1: creates a local copy of ratio.root, initializes LundReweighter,
+    computes the local distortion histogram, and returns the bin contents as a numpy array.
     """
-    f_ratio = ROOT.TFile.Open(ratio_file_path)
-    if not f_ratio or f_ratio.IsZombie():
-        raise RuntimeError(f"Could not open Lund ratio file at {ratio_file_path}")
-
-    print("\\nInitializing LundReweighter...")
-    LP_rw = LundReweighter(f_ratio=f_ratio)
-
-    ak8_jets = jets[:, :4]
-    gen_parts_eta_phi = quarks[:, :, 1:3]
-    gen_parts_pdg_id = quarks[:, :, 3]
-
-    # Assume unit weights for MC events in this example
-    nom_weights = np.ones(len(cands))
-
-    print("Computing Lund Plane weights (this may take a moment)...")
-
-    if seed is not None:
-        np.random.seed(seed)
-
-    nToys = 100
-    rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsX(), LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ()))
-    pt_rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ(), 3))
-
-    num_jets = len(jets)
-    num_chunks = math.ceil(num_jets / chunk_size)
-
-    # Pass 1: Global LP distribution for distortion systematic (requires reclustering)
-    print("Pass 1/2: Computing global Lund Plane distribution for distortion systematic...")
-    h_lp_signal = LP_rw.h_mc.Clone("h_lp_signal")
-    h_lp_signal.Reset()
+    worker_id = str(uuid.uuid4())
+    local_ratio = f"{ratio_file_path}.{worker_id}.tmp"
+    shutil.copy2(ratio_file_path, local_ratio)
     
-    for i in range(num_chunks):
-        start = i * chunk_size
-        end = min((i + 1) * chunk_size, num_jets)
-        print(f"  Analysing chunk {i+1}/{num_chunks} for distortion...")
-        for j in range(start, end):
-            # get_splittings_and_matching performs the expensive reclustering
-            reclust_nom, _, _ = LP_rw.get_splittings_and_matching(cands[j], gen_parts_eta_phi[j], ak8_jets[j])
-            if not reclust_nom.badmatch:
-                LP_rw.fill_lund_plane(h_lp_signal, reclust_obj=reclust_nom)
+    try:
+        f_ratio = ROOT.TFile.Open(local_ratio)
+        if not f_ratio or f_ratio.IsZombie():
+            return None
+            
+        LP_rw = LundReweighter(f_ratio=f_ratio)
+        h_lp_signal = LP_rw.h_mc.Clone(f"h_lp_signal_{worker_id}")
+        h_lp_signal.Reset()
+        
+        f_in = ROOT.TFile.Open(fpath)
+        if not f_in or f_in.IsZombie():
+            f_ratio.Close()
+            return None
+            
+        jets, quarks, cands = process_inputs(
+            input_file=f_in,
+            fatjet_branch=args.fatjet,
+            pfcand_branch=args.pfcand,
+            genpart_branch=args.genpart,
+            fatjet_pfcand_branch=args.fatjet_pfcand,
+            max_events=args.max_events,
+            jet_min_pt=args.min_pt,
+            triggers=triggers
+        )
+        f_in.Close()
+        
+        if len(jets) > 0:
+            ak8_jets = jets[:, :4]
+            gen_parts_eta_phi = quarks[:, :, 1:3]
+            for j in range(len(jets)):
+                reclust_nom, _, _ = LP_rw.get_splittings_and_matching(cands[j], gen_parts_eta_phi[j], ak8_jets[j])
+                if not reclust_nom.badmatch:
+                    LP_rw.fill_lund_plane(h_lp_signal, reclust_obj=reclust_nom)
+                    
+        ncells = h_lp_signal.GetNcells()
+        contents = np.zeros(ncells, dtype=np.float64)
+        for i in range(ncells):
+            contents[i] = h_lp_signal.GetBinContent(i)
+            
+        f_ratio.Close()
+        return contents
+        
+    except Exception as e:
+        print(f"Error in worker_pass1 for {fpath}: {e}")
+        return None
+    finally:
+        if os.path.exists(local_ratio):
+            os.remove(local_ratio)
+
+def get_global_distortion(inputs: List[str], LP_rw_global: Any, args: Any, triggers: List[str]) -> Any:
+    """
+    Pass 1: Reads all files in parallel to compute the global Lund Plane signal distribution
+    and calculates the global distortion ratio.
+    """
+    print(f"\n[Pass 1] Computing global Lund Plane distribution for distortion systematic (using {args.workers} workers)...")
+    h_lp_signal_global = LP_rw_global.h_mc.Clone("h_lp_signal_global")
+    h_lp_signal_global.Reset()
     
-    h_dummy = LP_rw.h_mc.Clone("h_dummy")
+    ncells = h_lp_signal_global.GetNcells()
+    global_contents = np.zeros(ncells, dtype=np.float64)
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(worker_pass1, fpath, args.ratio, args, triggers): fpath for fpath in inputs}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            fpath = futures[future]
+            print(f"  -> Pass 1 finished for {fpath} ({i+1}/{len(inputs)})")
+            res = future.result()
+            if res is not None:
+                global_contents += res
+
+    # Reconstruct the global TH3D
+    for i in range(ncells):
+        h_lp_signal_global.SetBinContent(i, global_contents[i])
+        # Sumw2 is implicitly handled for weight=1 by sqrt(content), but let's be explicit
+        h_lp_signal_global.GetSumw2().SetAt(global_contents[i], i)
+                
+    h_dummy = LP_rw_global.h_mc.Clone("h_dummy")
     h_dummy.Reset()
-    h_distortion_ratio = LP_rw.make_LP_ratio(LP_rw.h_mc, h_dummy, h_lp_signal)
-    # cleanup_ratio is available from utils.Utils (via LundReweighter import *)
+    h_distortion_ratio = LP_rw_global.make_LP_ratio(LP_rw_global.h_mc, h_dummy, h_lp_signal_global)
+    
     try:
         from utils.LundReweighter import cleanup_ratio
         cleanup_ratio(h_distortion_ratio, h_min=0.2, h_max=5.0)
     except ImportError:
-        pass # If not available, skip cleanup as it's a safety measure
+        pass
+        
+    return h_distortion_ratio
 
-    # Pass 2: Calculate weights with global distortion ratio
-    print("\nPass 2/2: Computing Lund Plane weights...")
+# ==============================================================================
+# 6. Raw Weight Calculation (Pass 2)
+# ==============================================================================
+
+def calculate_raw_weights(
+    jets: np.ndarray,
+    quarks: np.ndarray,
+    cands: List[List[List[float]]],
+    LP_rw: Any,
+    h_distortion_ratio: Any,
+    rand_noise: np.ndarray,
+    pt_rand_noise: np.ndarray,
+    chunk_size: int = 5000
+) -> Dict[str, Any]:
+    """
+    Computes the raw (unnormalized) Lund Plane weights for a single file in chunks.
+    """
+    ak8_jets = jets[:, :4]
+    gen_parts_eta_phi = quarks[:, :, 1:3]
+    gen_parts_pdg_id = quarks[:, :, 3]
+    
+    num_jets = len(jets)
+    num_chunks = math.ceil(num_jets / chunk_size)
+    nToys = rand_noise.shape[0]
+    
     LP_weights_combined = {}
 
     for i in range(num_chunks):
         start = i * chunk_size
         end = min((i + 1) * chunk_size, num_jets)
-        print(f"  Processing chunk {i+1}/{num_chunks}...")
 
         chunk_cands = cands[start:end]
         chunk_eta_phi = gen_parts_eta_phi[start:end]
         chunk_jets = ak8_jets[start:end]
         chunk_pdg_id = gen_parts_pdg_id[start:end]
 
-        # Call with distortion_sys=False to avoid local bias, we apply it manually below
         chunk_weights = LP_rw.get_all_weights(
             chunk_cands, chunk_eta_phi, chunk_jets, gen_parts_pdg_ids=chunk_pdg_id,
             nToys=nToys, rand_noise=rand_noise, pt_rand_noise=pt_rand_noise, 
             normalize=False, distortion_sys=False
         )
 
-        # Apply global distortion systematic manually for this chunk
         dist_up = np.zeros(len(chunk_jets))
         dist_down = np.zeros(len(chunk_jets))
         for j in range(len(chunk_jets)):
-            # Reclustering again is unfortunate but necessary for exact matching
             reclust_nom, _, _ = LP_rw.get_splittings_and_matching(chunk_cands[j], chunk_eta_phi[j], chunk_jets[j])
-            
-            # Use LP_rw.reweight_lund_plane to get the distortion weight
             distortion_weight, _, _ = LP_rw.reweight_lund_plane(h_rw=h_distortion_ratio, reclust_obj=reclust_nom, sys_str='distortion')
             
             dist_up[j] = chunk_weights['nom'][j] * distortion_weight
@@ -425,70 +464,179 @@ def calculate_weights_and_sf(
                 elif isinstance(val, list):
                     LP_weights_combined[key].extend(val)
 
-    # Concatenate the accumulated numpy arrays
     for key, val in LP_weights_combined.items():
         if isinstance(val, list) and len(val) > 0 and isinstance(val[0], np.ndarray):
             LP_weights_combined[key] = np.concatenate(val, axis=0)
 
-    # Manual Normalization
-    print("Normalizing combined weights...")
-    for key in LP_weights_combined.keys():
+    return LP_weights_combined
+
+def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str], 
+                 rand_noise: np.ndarray, pt_rand_noise: np.ndarray, 
+                 dist_contents: np.ndarray) -> Tuple[str, Dict[str, Any], np.ndarray]:
+    """
+    Worker for Pass 2: processes one file, reconstructs global distortion ratio,
+    and calculates raw weights.
+    """
+    worker_id = str(uuid.uuid4())
+    local_ratio = f"{ratio_file_path}.{worker_id}.tmp"
+    shutil.copy2(ratio_file_path, local_ratio)
+    
+    try:
+        f_ratio = ROOT.TFile.Open(local_ratio)
+        if not f_ratio or f_ratio.IsZombie():
+            return fpath, {}, np.array([])
+            
+        LP_rw = LundReweighter(f_ratio=f_ratio)
+        
+        # Reconstruct h_distortion_ratio from contents
+        h_distortion_ratio = LP_rw.h_mc.Clone(f"h_dist_{worker_id}")
+        h_distortion_ratio.Reset()
+        for i in range(h_distortion_ratio.GetNcells()):
+            h_distortion_ratio.SetBinContent(i, dist_contents[i])
+            
+        f_in = ROOT.TFile.Open(fpath)
+        if not f_in or f_in.IsZombie():
+            f_ratio.Close()
+            return fpath, {}, np.array([])
+            
+        jets, quarks, cands = process_inputs(
+            input_file=f_in,
+            fatjet_branch=args.fatjet,
+            pfcand_branch=args.pfcand,
+            genpart_branch=args.genpart,
+            fatjet_pfcand_branch=args.fatjet_pfcand,
+            max_events=args.max_events,
+            jet_min_pt=args.min_pt,
+            triggers=triggers
+        )
+        f_in.Close()
+        
+        if len(jets) == 0:
+            f_ratio.Close()
+            return fpath, {}, np.array([])
+            
+        raw_weights = calculate_raw_weights(jets, quarks, cands, LP_rw, h_distortion_ratio, rand_noise, pt_rand_noise, args.chunk_size)
+        f_ratio.Close()
+        
+        return fpath, raw_weights, jets
+    except Exception as e:
+        print(f"Error in worker_pass2 for {fpath}: {e}")
+        return fpath, {}, np.array([])
+    finally:
+        if os.path.exists(local_ratio):
+            os.remove(local_ratio)
+
+# ==============================================================================
+# 7. Global Normalization (Pass 3)
+# ==============================================================================
+
+def normalize_all_weights(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], LP_rw: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    Concatenates weights from all files, normalizes them using the global mean,
+    and returns a dictionary of normalized weights keyed by filename.
+    """
+    print("\n[Pass 3] Normalizing combined weights across all files...")
+    fnames = list(all_raw_weights.keys())
+    if not fnames:
+        return {}
+        
+    global_weights = {}
+    keys_to_concat = list(all_raw_weights[fnames[0]].keys())
+    
+    # Concatenate globally
+    for key in keys_to_concat:
+        if isinstance(all_raw_weights[fnames[0]][key], np.ndarray):
+            global_weights[key] = np.concatenate([all_raw_weights[f][key] for f in fnames], axis=0)
+            
+    global_ak8_pts = np.concatenate([all_jets[f][:, 0] for f in fnames], axis=0)
+    
+    # Normalize globally
+    for key in global_weights.keys():
         if 'nom' in key or 'up' in key or 'down' in key or 'vars' in key:
-            if isinstance(LP_weights_combined[key], np.ndarray):
-                LP_weights_combined[key] = LP_rw.normalize_weights(
-                    LP_weights_combined[key],
-                    n_prongs=LP_weights_combined['n_prongs'],
-                    pt_norm=True,
-                    ak8_pts=ak8_jets[:, 0]
-                )
+            global_weights[key] = LP_rw.normalize_weights(
+                global_weights[key],
+                n_prongs=global_weights['n_prongs'],
+                pt_norm=True,
+                ak8_pts=global_ak8_pts
+            )
+            
+    # Split back into per-file dictionaries
+    all_normalized_weights = {}
+    current_idx = 0
+    for f in fnames:
+        num_events = len(all_jets[f])
+        all_normalized_weights[f] = {}
+        # Keep non-ndarray values (like bad_match list) from raw weights
+        for key in all_raw_weights[f].keys():
+            if isinstance(all_raw_weights[f][key], np.ndarray):
+                all_normalized_weights[f][key] = global_weights[key][current_idx : current_idx + num_events]
+            else:
+                all_normalized_weights[f][key] = all_raw_weights[f][key]
+        current_idx += num_events
+        
+    return all_normalized_weights
 
-    LP_weights = LP_weights_combined
+# ==============================================================================
+# 8. Scale Factor and Uncertainty (Pass 4)
+# ==============================================================================
 
+def calculate_sf_and_unc(all_normalized_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], tau21_cut: float) -> Dict[str, Any]:
+    """
+    Computes global efficiency, scale factors, and uncertainties.
+    """
+    print("\n[Pass 4] Calculating global Scale Factor and uncertainties...")
+    fnames = list(all_normalized_weights.keys())
+    if not fnames:
+        return {}
+        
+    global_jets = np.concatenate([all_jets[f] for f in fnames], axis=0)
+    nom_weights = np.ones(len(global_jets)) # Unit weights for MC
+    
+    # Concatenate normalized LP weights for global calculation
+    global_LP_weights = {}
+    for key in all_normalized_weights[fnames[0]].keys():
+        if isinstance(all_normalized_weights[fnames[0]][key], np.ndarray):
+            global_LP_weights[key] = np.concatenate([all_normalized_weights[f][key] for f in fnames], axis=0)
+        elif isinstance(all_normalized_weights[fnames[0]][key], list):
+            global_LP_weights[key] = []
+            for f in fnames:
+                global_LP_weights[key].extend(all_normalized_weights[f][key])
+    
     # Multiply LP weights with event weights
-    for key in LP_weights.keys():
+    for key in global_LP_weights.keys():
         if "nom" in key or "up" in key or "down" in key or "vars" in key:
-            if isinstance(LP_weights[key], np.ndarray):
-                if LP_weights[key].ndim == 2:
-                    LP_weights[key] *= nom_weights[:, np.newaxis]
+            if isinstance(global_LP_weights[key], np.ndarray):
+                if global_LP_weights[key].ndim == 2:
+                    global_LP_weights[key] *= nom_weights[:, np.newaxis]
                 else:
-                    LP_weights[key] *= nom_weights
+                    global_LP_weights[key] *= nom_weights
 
-    print(f"Average Bad Match Fraction: {np.mean(LP_weights.get('bad_match', [0])):.3f}")
+    print(f"Average Bad Match Fraction: {np.mean(global_LP_weights.get('bad_match', [0])):.3f}")
 
-    # ===============================
-    # Efficiency & SF calculation
-    # ===============================
-    tau21 = jets[:, 4]
+    tau21 = global_jets[:, 4]
     score_cut = tau21 < tau21_cut
 
     eff_nom = np.average(score_cut, weights=nom_weights)
-    eff_rw = np.average(score_cut, weights=LP_weights["nom"])
+    eff_rw = np.average(score_cut, weights=global_LP_weights["nom"])
     sf_nominal = eff_rw / eff_nom if eff_nom > 0 else 0.0
 
     print(f"Nominal Eff: {eff_nom:.3f} | Corrected Eff: {eff_rw:.3f} | SF: {sf_nominal:.3f}")
 
-    # ===============================
-    # Uncertainty Calculation
-    # ===============================
-
-    # 1. Statistical and Pt extrapolation uncertainties (via Toys)
-    nToys = LP_weights["stat_vars"].shape[1]
-    eff_toys = [np.average(score_cut, weights=LP_weights["stat_vars"][:, i]) for i in range(nToys)]
-    pt_eff_toys = [np.average(score_cut, weights=LP_weights["pt_vars"][:, i]) for i in range(nToys)]
+    nToys = global_LP_weights["stat_vars"].shape[1]
+    eff_toys = [np.average(score_cut, weights=global_LP_weights["stat_vars"][:, i]) for i in range(nToys)]
+    pt_eff_toys = [np.average(score_cut, weights=global_LP_weights["pt_vars"][:, i]) for i in range(nToys)]
 
     eff_stat_unc = abs(np.mean(eff_toys) - eff_rw) + np.std(eff_toys)
     eff_pt_unc = abs(np.mean(pt_eff_toys) - eff_rw) + np.std(pt_eff_toys)
 
-    # 2. Up/Down Systematic Uncertainties
     sys_keys = ["sys", "bquark", "prongs", "unclust", "distortion"]
     sys_uncs = {}
 
     for sys_key in sys_keys:
-        eff_up = np.average(score_cut, weights=LP_weights.get(f"{sys_key}_up", LP_weights["nom"]))
-        eff_down = np.average(score_cut, weights=LP_weights.get(f"{sys_key}_down", LP_weights["nom"]))
+        eff_up = np.average(score_cut, weights=global_LP_weights.get(f"{sys_key}_up", global_LP_weights["nom"]))
+        eff_down = np.average(score_cut, weights=global_LP_weights.get(f"{sys_key}_down", global_LP_weights["nom"]))
         sys_uncs[sys_key] = (eff_up - eff_rw, eff_down - eff_rw)
 
-    # 3. Summing in Quadrature
     tot_unc_up_sq = eff_stat_unc**2 + eff_pt_unc**2
     tot_unc_down_sq = eff_stat_unc**2 + eff_pt_unc**2
 
@@ -498,8 +646,6 @@ def calculate_weights_and_sf(
 
     tot_unc_up = math.sqrt(tot_unc_up_sq)
     tot_unc_down = math.sqrt(tot_unc_down_sq)
-
-    f_ratio.Close()
 
     results = {
         "eff_nom": eff_nom,
@@ -520,84 +666,83 @@ def calculate_weights_and_sf(
     return results
 
 # ==============================================================================
-# 6. Main Flow
+# 9. Main Flow
 # ==============================================================================
 
 def main():
     """
     Main CLI entry point to orchestrate the refactored LJP pipeline.
     """
-    parser = argparse.ArgumentParser(
-        description="Run Lund Jet Plane Reweighting on an Ntuple/NanoAOD file."
-    )
-    parser.add_argument("--input", type=str, default="/t3home/fameng/work/BosonRes/CMSSW_14_1_9/src/LundReweighting/013c4b44-92a8-42a8-ac27-c127158c4726.root",
-                        help="Path to the signal ROOT file.")
+    parser = argparse.ArgumentParser(description="Run Lund Jet Plane Reweighting on Ntuple/NanoAOD files.")
+    parser.add_argument("--inputs", nargs="+", default=["/t3home/fameng/work/BosonRes/CMSSW_14_1_9/src/LundReweighting/013c4b44-92a8-42a8-ac27-c127158c4726.root"],
+                        help="List of paths to the signal ROOT files.")
     parser.add_argument("--ratio", type=str, default="data/ratio_2018.root",
                         help="Path to the Lund Plane ratio correction ROOT file.")
-    parser.add_argument("--fatjet", type=str, default="FatJet",
-                        help="Branch name for large radius jets (FatJets).")
-    parser.add_argument("--pfcand", type=str, default="PFCand",
-                        help="Branch name for PF Candidates.")
-    parser.add_argument("--genpart", type=str, default="GenPart",
-                        help="Branch name for Generator-level particles.")
-    parser.add_argument("--fatjet_pfcand", type=str, default="FatJetPFCand",
-                        help="Branch name mapping FatJets to PFCands.")
-    parser.add_argument("--max_events", type=int, default=1000,
-                        help="Maximum events to evaluate.")
-    parser.add_argument("--min_pt", type=float, default=400.0,
-                        help="Minimum transverse momentum cut for jets.")
-    parser.add_argument("--tau21_cut", type=float, default=0.4,
-                        help="Tau21 substructure cut to evaluate for the SF.")
-    parser.add_argument("--chunk_size", type=int, default=5000,
-                        help="Number of jets to process simultaneously to save memory.")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for toy variations.")
+    parser.add_argument("--fatjet", type=str, default="FatJet", help="Branch name for FatJets.")
+    parser.add_argument("--pfcand", type=str, default="PFCand", help="Branch name for PF Candidates.")
+    parser.add_argument("--genpart", type=str, default="GenPart", help="Branch name for Generator-level particles.")
+    parser.add_argument("--fatjet_pfcand", type=str, default="FatJetPFCand", help="Branch name mapping FatJets to PFCands.")
+    parser.add_argument("--max_events", type=int, default=1000, help="Maximum events to evaluate per file.")
+    parser.add_argument("--min_pt", type=float, default=400.0, help="Minimum transverse momentum cut for jets.")
+    parser.add_argument("--tau21_cut", type=float, default=0.4, help="Tau21 substructure cut to evaluate for the SF.")
+    parser.add_argument("--chunk_size", type=int, default=5000, help="Number of jets to process simultaneously to save memory.")
+    parser.add_argument("--workers", type=int, default=16, help="Number of parallel workers for processing.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for toy variations.")
 
     args = parser.parse_args()
 
-    print(f"Opening input file: {args.input}")
-    f_sig = ROOT.TFile.Open(args.input)
-    if not f_sig or f_sig.IsZombie():
-        print(f"Error: Unable to load input file {args.input}")
+    f_ratio = ROOT.TFile.Open(args.ratio)
+    if not f_ratio or f_ratio.IsZombie():
+        print(f"Error: Unable to load ratio file {args.ratio}")
         sys.exit(1)
 
-    triggers = [
-        "HLT_PFHT890",
-        "HLT_PFHT1050",
-        "HLT_PFJet450",
-        "HLT_PFJet500",
-    ]
+    print("\nInitializing LundReweighter...")
+    LP_rw = LundReweighter(f_ratio=f_ratio)
 
-    print("\n[1/2] Processing inputs and extracting arrays...")
-    jets, quarks, cands = process_inputs(
-        input_file=f_sig,
-        fatjet_branch=args.fatjet,
-        pfcand_branch=args.pfcand,
-        genpart_branch=args.genpart,
-        fatjet_pfcand_branch=args.fatjet_pfcand,
-        max_events=args.max_events,
-        jet_min_pt=args.min_pt,
-        triggers=triggers
-    )
+    if args.seed is not None:
+        np.random.seed(args.seed)
 
-    f_sig.Close()
+    nToys = 100
+    rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsX(), LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ()))
+    pt_rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ(), 3))
 
-    if len(jets) == 0:
-        print("Pipeline aborted: No matching jets passed the predefined criteria.")
+    triggers = ["HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450", "HLT_PFJet500"]
+
+    # Pass 1: Global Distortion
+    h_distortion_ratio = get_global_distortion(args.inputs, LP_rw, args, triggers)
+
+    # Extract distortion bin contents to pass to workers
+    dist_ncells = h_distortion_ratio.GetNcells()
+    dist_contents = np.zeros(dist_ncells, dtype=np.float64)
+    for i in range(dist_ncells):
+        dist_contents[i] = h_distortion_ratio.GetBinContent(i)
+
+    all_raw_weights = {}
+    all_jets = {}
+
+    # Pass 2: Raw Weights (Multiprocessing)
+    print(f"\n[Pass 2] Computing raw Lund Plane weights (using {args.workers} workers)...")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(worker_pass2, fpath, args.ratio, args, triggers, rand_noise, pt_rand_noise, dist_contents): fpath for fpath in args.inputs}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            fpath = futures[future]
+            fpath_res, raw_weights, jets = future.result()
+            print(f"  -> Pass 2 finished for {fpath_res} ({i+1}/{len(args.inputs)})")
+            if len(jets) > 0 and raw_weights:
+                all_raw_weights[fpath_res] = raw_weights
+                all_jets[fpath_res] = jets
+
+    if not all_raw_weights:
+        print("\nPipeline aborted: No matching jets passed in any input file.")
         sys.exit(0)
 
-    print(f"Successfully extracted {len(jets)} jets.")
+    # Pass 3: Global Normalization
+    all_normalized_weights = normalize_all_weights(all_raw_weights, all_jets, LP_rw)
 
-    print("\n[2/2] Calculating Lund Weights and Scale Factors...")
-    _ = calculate_weights_and_sf(
-        jets=jets,
-        quarks=quarks,
-        cands=cands,
-        ratio_file_path=args.ratio,
-        tau21_cut=args.tau21_cut,
-        chunk_size=args.chunk_size,
-        seed=args.seed
-    )
+    # Pass 4: Final SF and Uncertainties
+    _ = calculate_sf_and_unc(all_normalized_weights, all_jets, args.tau21_cut)
+
+    f_ratio.Close()
 
 if __name__ == "__main__":
     main()

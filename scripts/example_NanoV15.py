@@ -8,16 +8,16 @@ sys.path.append("../")
 from utils.Utils import *
 
 
-""" 
-An example how to use the Lund Plane reweighting code on a signal file in NanoV15 
-Computes reweighting factors for an example signal. 
+"""
+An example how to use the Lund Plane reweighting code on a signal file in NanoV15
+Computes reweighting factors for an example signal.
 It then uses them to compute the efficiency and uncertainty of a given substructure cut
 
 This example uses NanoAODTools to read the relevant branches from the Nano V15
-This tool is included in CMSSW, but can be used standalone as well : 
+This tool is included in CMSSW, but can be used standalone as well :
  https://github.com/cms-sw/cmssw/tree/master/PhysicsTools/NanoAODTools
 
-Note that the correction itself does not use NanoAODTools, the user is welcome to use whatever 
+Note that the correction itself does not use NanoAODTools, the user is welcome to use whatever
 framework they like for reading the values from NanoAOD.
 
 """
@@ -91,10 +91,10 @@ def get_ttbar_gen_parts(event, verbose=True):
     for genPart in GenPartsColl:
         # Find quarks or leptons from W decay
         m = genPart.genPartIdxMother
-        mother = GenPartsColl[m] if m > 0 else None
+        mother = GenPartsColl[m] if m >= 0 else None
         w_mother_match = mother is W
         anti_w_mother_match = mother is anti_W
-        if abs(genPart.pdgId) <= MAXLEP_ID and m > 0 and w_mother_match:
+        if abs(genPart.pdgId) <= MAXLEP_ID and m >= 0 and w_mother_match:
             if genPart.pdgId > 0:
                 if fermion1 is None:
                     fermion1 = genPart
@@ -106,7 +106,7 @@ def get_ttbar_gen_parts(event, verbose=True):
                 elif verbose:
                     print("WARNING : Extra anti quark ? ")
 
-        elif abs(genPart.pdgId) <= MAXLEP_ID and m > 0 and anti_w_mother_match:
+        elif abs(genPart.pdgId) <= MAXLEP_ID and m >= 0 and anti_w_mother_match:
             if genPart.pdgId > 0:
                 if fermion2 is None:
                     fermion2 = genPart
@@ -224,13 +224,13 @@ def get_inputs(inputFile, max_events=5000):
 
 
 
-        # Select the leading jet with pt > 400 
+        # Select the leading jet with pt > 400
         # We also require our fatjet to be a genuine mutli-prong jet, checking that it contains two or more gen level quarks from the top decay inside it
         # Note you don't have to require a truth-matching like this in your analysis, we just use it here for a purer sample of boosted top/W's
         jet_min_pt = 400
         my_jet = None
 
-        if(len(AK8Jets) == 0 or AK8Jets[0].pt < jet_min_pt): 
+        if(len(AK8Jets) == 0 or AK8Jets[0].pt < jet_min_pt):
             continue
 
         #Get gen-level quarks which define our prongs
@@ -310,7 +310,7 @@ def get_inputs(inputFile, max_events=5000):
 # Input NanoV15 file  for signal, here we use a ttbar file for example
 # NOTE you may want to change the file redirector depending on your region
 # Alternatively you can use xrootd to copy the file locally which may be faster (its ~1.5 GB)
-fname = "root://cms-xrd-global.cern.ch//store/mc/RunIII2024Summer24NanoAODv15/TTto4Q_TuneCP5_13p6TeV_powheg-pythia8/NANOAODSIM/150X_mcRun3_2024_realistic_v1-v2/100000/013c4b44-92a8-42a8-ac27-c127158c4726.root"
+fname = "/t3home/fameng/work/BosonRes/CMSSW_14_1_9/src/LundReweighting/013c4b44-92a8-42a8-ac27-c127158c4726.root"
 #fname = "TTbar_Nano_test.root"
 
 # File with the correction ingredients (centrally provided)
@@ -325,7 +325,7 @@ f_ratio = ROOT.TFile.Open(f_ratio_name)
 
 # For this example just run over small sample
 # Generally one should run over the entire signal MC
-max_evts = 1000
+max_evts = 5000
 
 # Get the needed inputs for the reweighting
 print("Getting inputs from Nano")
@@ -353,6 +353,9 @@ nom_weights = np.ones(len(pf_cands))
 
 
 # ----------- Do the reweighting ---------------------
+# Set seed for reproducibility
+np.random.seed(42)
+
 # Use the tool to compute the weights
 
 # The 'get_all_weights' 'master' function, it computes all the weights for you and the systematic variations
@@ -490,7 +493,7 @@ for sys in sys_keys:
 
 
 # Print uncertainty breakdown
-eff_str = "Calibrated efficiency  is %.2f +/- %.2f (stat) +/- %.2f (pt)" % (
+eff_str = "Calibrated efficiency  is %.4f +/- %.4f (stat) +/- %.4f (pt)" % (
     eff_rw,
     eff_stat_unc,
     eff_pt_unc,
@@ -511,7 +514,7 @@ tot_unc_down = tot_unc_down**0.5
 # Note to get the 'scale factor' we just divide by the nominal efficiency
 
 # Print final calibrated efficiency and total uncertaintiy
-eff_str += "\n Original Eff. %.2f, Lund Plane Corrected Eff. %.2f +%.2f/-%.2f. SF %.2f +%.2f/-%.2f\n" % (
+eff_str += "\n Original Eff. %.4f, Lund Plane Corrected Eff. %.4f +%.4f/-%.4f. SF %.4f +%.4f/-%.4f\n" % (
     eff_nom,
     eff_rw,
     tot_unc_up,

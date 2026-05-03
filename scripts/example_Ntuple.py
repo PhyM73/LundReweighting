@@ -303,7 +303,7 @@ def process_inputs(
             full_quarks = [q1a, q1b, b1, q2a, q2b, b2]
             quark_group = []
             for q in full_quarks:
-                if q is not None and q in matched_q:
+                if q is not None:
                     quark_group.append(parse_part(q))
                 else:
                     quark_group.append([0.0, 999.0, 999.0, 0.0])
@@ -443,7 +443,6 @@ def calculate_raw_weights(
     rand_noise: np.ndarray,
     pt_rand_noise: np.ndarray,
     chunk_size: int = 5000,
-    w_max: float = 10.0
 ) -> Dict[str, Any]:
     """
     Computes the raw (unnormalized) Lund Plane weights for a single file in chunks.
@@ -507,10 +506,6 @@ def calculate_raw_weights(
         if isinstance(val, list) and len(val) > 0 and isinstance(val[0], np.ndarray):
             LP_weights_combined[key] = np.concatenate(val, axis=0)
 
-        # Apply clipping to all weight-related arrays
-        if isinstance(LP_weights_combined[key], np.ndarray) and any(x in key for x in ['nom', 'up', 'down', 'vars']):
-            LP_weights_combined[key] = np.clip(LP_weights_combined[key], 0.0, w_max)
-
     return LP_weights_combined
 
 def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str],
@@ -561,7 +556,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             f_ratio.Close()
             return fpath, {}, np.array([]), np.array([])
 
-        raw_weights = calculate_raw_weights(jets, quarks, cands, LP_rw, h_distortion_ratio, rand_noise, pt_rand_noise, args.chunk_size, args.w_max)
+        raw_weights = calculate_raw_weights(jets, quarks, cands, LP_rw, h_distortion_ratio, rand_noise, pt_rand_noise, args.chunk_size)
         f_ratio.Close()
 
         return fpath, raw_weights, jets, n_jets_per_event, gen_weights
@@ -742,13 +737,12 @@ def parse_arguments():
                         help="List of additional jet features to extract (e.g. tau1 tau2).")
     parser.add_argument("--selection_func", type=str, default="tau21_selections",
                         help="Name of the selection function in scripts/selections.py.")
-    parser.add_argument("--triggers", type=str, nargs="+", default=["HLT_PFJet500"],
+    parser.add_argument("--triggers", type=str, nargs="+", default=["HLT_PFJet500","HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450"],
                         help="List of trigger branch names.")
     parser.add_argument("--chunk_size", type=int, default=5000, help="Number of jets to process simultaneously to save memory.")
     parser.add_argument("--workers", type=int, default=16, help="Number of parallel workers for processing.")
     parser.add_argument("--topology", type=str, choices=["b2b", "boost"], default="b2b",
                         help="Jet topology: 'b2b' (ttbar-like, no cross-matching) or 'boost' (H->4q like, pool matching).")
-    parser.add_argument("--w_max", type=float, default=10.0, help="Maximum weight allowed for clipping to remove outliers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for toy variations.")
 
     args = parser.parse_args()

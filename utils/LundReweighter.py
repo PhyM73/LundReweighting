@@ -555,21 +555,32 @@ class LundReweighter():
         return prongs_up_weight, prongs_down_weight
 
     def check_reclust_still_bad(self, reclust_prongs_up, reclust_prongs_down):
-        """Check if up/down variations of num. prongs produced a reclustering with better matching"""
-        still_bad = False
-        if(reclust_prongs_up is not None):
+        """Check if up/down variations of num. prongs produced a reclustering with better matching.
+        Returns True (unclustered) only if NEITHER variation rescued the unmatched quarks,
+        per JME-23-001 sec8.6: 'If a generator-level quark is not matched to a subjet,
+        in both the nominal exclusive kT reclustering and in the variations in the number
+        of prongs, it is considered unclustered.'"""
 
-            if( reclust_prongs_up.from_badmatch and (np.sum(reclust_prongs_up.subjet_match) != (reclust_prongs_up.n_prongs-1) or
-                np.sum(reclust_prongs_up.subjet_double_matched) != 0)):
-                   still_bad= True
+        rescued = False
+        any_attempted_from_badmatch = False
 
-        if(reclust_prongs_down is not None):
+        if(reclust_prongs_up is not None and reclust_prongs_up.from_badmatch):
+            any_attempted_from_badmatch = True
+            up_good = (np.sum(reclust_prongs_up.subjet_match) == (reclust_prongs_up.n_prongs - 1) and
+                       np.sum(reclust_prongs_up.subjet_double_matched) == 0)
+            if(up_good):
+                rescued = True
 
-            if( reclust_prongs_down.from_badmatch and (np.sum(reclust_prongs_down.subjet_match) != (reclust_prongs_down.n_prongs) or
-                np.sum(reclust_prongs_down.subjet_double_matched) != 0)):
-                   still_bad = True
+        if(reclust_prongs_down is not None and reclust_prongs_down.from_badmatch):
+            any_attempted_from_badmatch = True
+            down_good = (np.sum(reclust_prongs_down.subjet_match) == reclust_prongs_down.n_prongs and
+                         np.sum(reclust_prongs_down.subjet_double_matched) == 0)
+            if(down_good):
+                rescued = True
 
-        return still_bad
+        # Still bad only if at least one variation was attempted due to bad nominal
+        # matching, and none of them rescued it
+        return any_attempted_from_badmatch and not rescued
 
     def init_weight_dict(self, nEvts, nToys):
 

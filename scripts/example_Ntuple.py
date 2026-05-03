@@ -51,6 +51,11 @@ def deltaR(eta1: float, phi1: float, eta2: float, phi2: float) -> float:
     """Calculates the delta R distance in the eta-phi plane."""
     return math.sqrt((eta1 - eta2)**2 + ang_dist(phi1, phi2)**2)
 
+def parse_part(p: Any) -> List[float]:
+    """Extract Gen Quark features"""
+    # Use 999.0 as a safety value for eta/phi to avoid false matching at the detector center
+    return [p.pt, p.eta, p.phi, float(p.pdgId)] if p else [0.0, 999.0, 999.0, 0.0]
+
 # ==============================================================================
 # 1. Matching Logic
 # ==============================================================================
@@ -173,11 +178,12 @@ def process_inputs(
     pfcand_branch: str = "PFCand",
     genpart_branch: str = "GenPart",
     fatjet_pfcand_branch: str = "FatJetPFCand",
-        max_process_jets: int = 5000,
-        jet_min_pt: float = 400.0,
-        triggers: Optional[List[str]] = None,
-        topology: str = "b2b"
-    ) -> Tuple[np.ndarray, np.ndarray, List[List[List[float]]]]:
+    genweight_branch: str = "genWeight",
+    max_process_jets: int = 5000,
+    jet_min_pt: float = 400.0,
+    triggers: Optional[List[str]] = None,
+    topology: str = "b2b"
+) -> Tuple[np.ndarray, np.ndarray, List[List[List[float]]], np.ndarray, np.ndarray]:
     """
     Processes the input ROOT tree, applying selections and extracting arrays
     for jets, gen quarks, and PF candidates.
@@ -210,12 +216,19 @@ def process_inputs(
     jets_list = []
     quarks_list = []
     cands_list = []
+    gen_weights_list = []
 
     for entry in range(inTree.entries):
         event = Event(inTree, entry)
 
         if not apply_selections(inTree, triggers):
             continue
+
+        # Get Event Weight
+        try:
+            event_weight = inTree.readBranch(genweight_branch)
+        except RuntimeError:
+            event_weight = 1.0
 
         try:
             AK8Jets = Collection(event, fatjet_branch)
@@ -232,7 +245,9 @@ def process_inputs(
         _, _, _, _, q1a, q1b, b1, q2a, q2b, b2 = gen_parts
 
         # Pool of potential quarks for matching
-        potential_quarks = [q1a, q1b, q2a, q2b] # Exclude b quarks for boost topology
+        potential_quarks_evt = [q1a, q1b, q2a, q2b] # Copy for the event
+        source1_active = True
+        source2_active = True
 
         n_jets_in_event = 0
         matched_jets_in_event = []
@@ -243,21 +258,34 @@ def process_inputs(
             if jet.pt > jet_min_pt and abs(jet.eta) < 2.4:
                 # Selection based on topology
                 if topology == "boost":
-                    # Boosted: allow matching from the full pool (e.g. H->4q, WW-merged)
-                    matched_q = get_matched_quarks(jet, potential_quarks)
-                    if len(matched_q) >= 2:
-                        matched_jets_in_event.append(jet)
-                        matched_quarks_in_event.append(matched_q)
+                    if len(potential_quarks_evt) >= 2:
+                        # Boosted: allow matching from the full pool (e.g. H->4q, WW-merged)
+                        matched_q = get_matched_quarks(jet, potential_quarks_evt)
+                        if len(matched_q) >= 2:
+                            matched_jets_in_event.append(jet)
+                            matched_quarks_in_event.append(matched_q)
+                            # Remove matched quarks from the pool to avoid double counting
+                            for q in matched_q:
+                                if q in potential_quarks_evt:
+                                    potential_quarks_evt.remove(q)
+                    else:
+                        break # No more jets can possibly match at least 2 quarks
                 else:
                     # b2b (default): separate Top1 and Top2 decay chains (e.g. ttbar, tW)
-                    matched_q1 = get_matched_quarks(jet, [q1a, q1b, b1])
-                    matched_q2 = get_matched_quarks(jet, [q2a, q2b, b2])
+                    matched_q1 = get_matched_quarks(jet, [q1a, q1b, b1]) if source1_active else []
+                    matched_q2 = get_matched_quarks(jet, [q2a, q2b, b2]) if source2_active else []
+
                     if len(matched_q1) >= 2:
                         matched_jets_in_event.append(jet)
                         matched_quarks_in_event.append(matched_q1)
+                        source1_active = False
                     elif len(matched_q2) >= 2:
                         matched_jets_in_event.append(jet)
                         matched_quarks_in_event.append(matched_q2)
+                        source2_active = False
+
+                    if not source1_active and not source2_active:
+                        break # Both decay chains consumed
 
         n_events_evaluated += 1
         n_jets_per_event.append(len(matched_jets_in_event))
@@ -274,11 +302,6 @@ def process_inputs(
             jets_list.append([
                 jet.pt, jet.eta, jet.phi, getattr(jet, "msoftdrop", 0), tau21, pnet_xqq
             ])
-
-            # Extract Gen Quark features
-            def parse_part(p: Any) -> List[float]:
-                # Use 999.0 as a safety value for eta/phi to avoid false matching at the detector center
-                return [p.pt, p.eta, p.phi, float(p.pdgId)] if p else [0.0, 999.0, 999.0, 0.0]
 
             # The full 6 slots standard for the output
             full_quarks = [q1a, q1b, b1, q2a, q2b, b2]
@@ -302,12 +325,13 @@ def process_inputs(
                     jet_PFCands.append([cand_vec.Px(), cand_vec.Py(), cand_vec.Pz(), cand_vec.E()])
 
             cands_list.append(jet_PFCands)
+            gen_weights_list.append(event_weight)
             n_selected_jets += 1
 
         if max_process_jets >= 0 and n_selected_jets >= max_process_jets:
             break
 
-    return np.array(jets_list), np.array(quarks_list), cands_list, np.array(n_jets_per_event)
+    return np.array(jets_list), np.array(quarks_list), cands_list, np.array(n_jets_per_event), np.array(gen_weights_list)
 
 ## ==============================================================================
 # 5. Global Distortion (Pass 1)
@@ -327,7 +351,7 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return None
 
-        LP_rw = LundReweighter(f_ratio=f_ratio)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
         h_lp_signal = LP_rw.h_mc.Clone(f"h_lp_signal_{worker_id}")
         h_lp_signal.Reset()
 
@@ -336,12 +360,13 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             f_ratio.Close()
             return None
 
-        jets, quarks, cands, n_jets_per_event = process_inputs(
+        jets, quarks, cands, n_jets_per_event, _ = process_inputs(
             input_file=f_in,
             fatjet_branch=args.fatjet,
             pfcand_branch=args.pfcand,
             genpart_branch=args.genpart,
             fatjet_pfcand_branch=args.fatjet_pfcand,
+            genweight_branch=args.genweight,
             max_process_jets=args.max_process_jets,
             jet_min_pt=args.min_pt,
             triggers=triggers,
@@ -423,7 +448,8 @@ def calculate_raw_weights(
     h_distortion_ratio: Any,
     rand_noise: np.ndarray,
     pt_rand_noise: np.ndarray,
-    chunk_size: int = 5000
+    chunk_size: int = 5000,
+    w_max: float = 10.0
 ) -> Dict[str, Any]:
     """
     Computes the raw (unnormalized) Lund Plane weights for a single file in chunks.
@@ -487,6 +513,10 @@ def calculate_raw_weights(
         if isinstance(val, list) and len(val) > 0 and isinstance(val[0], np.ndarray):
             LP_weights_combined[key] = np.concatenate(val, axis=0)
 
+        # Apply clipping to all weight-related arrays
+        if isinstance(LP_weights_combined[key], np.ndarray) and any(x in key for x in ['nom', 'up', 'down', 'vars']):
+            LP_weights_combined[key] = np.clip(LP_weights_combined[key], 0.0, w_max)
+
     return LP_weights_combined
 
 def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str],
@@ -505,7 +535,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return fpath, {}, np.array([]), np.array([])
 
-        LP_rw = LundReweighter(f_ratio=f_ratio)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
 
         # Reconstruct h_distortion_ratio from contents
         h_distortion_ratio = LP_rw.h_mc.Clone(f"h_dist_{worker_id}")
@@ -518,12 +548,13 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             f_ratio.Close()
             return fpath, {}, np.array([]), np.array([])
 
-        jets, quarks, cands, n_jets_per_event = process_inputs(
+        jets, quarks, cands, n_jets_per_event, gen_weights = process_inputs(
             input_file=f_in,
             fatjet_branch=args.fatjet,
             pfcand_branch=args.pfcand,
             genpart_branch=args.genpart,
             fatjet_pfcand_branch=args.fatjet_pfcand,
+            genweight_branch=args.genweight,
             max_process_jets=args.max_process_jets,
             jet_min_pt=args.min_pt,
             triggers=triggers,
@@ -535,13 +566,13 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             f_ratio.Close()
             return fpath, {}, np.array([]), np.array([])
 
-        raw_weights = calculate_raw_weights(jets, quarks, cands, LP_rw, h_distortion_ratio, rand_noise, pt_rand_noise, args.chunk_size)
+        raw_weights = calculate_raw_weights(jets, quarks, cands, LP_rw, h_distortion_ratio, rand_noise, pt_rand_noise, args.chunk_size, args.w_max)
         f_ratio.Close()
 
-        return fpath, raw_weights, jets, n_jets_per_event
+        return fpath, raw_weights, jets, n_jets_per_event, gen_weights
     except Exception as e:
         print(f"Error in worker_pass2 for {fpath}: {e}")
-        return fpath, {}, np.array([]), np.array([])
+        return fpath, {}, np.array([]), np.array([]), np.array([])
     finally:
         if os.path.exists(local_ratio):
             os.remove(local_ratio)
@@ -568,18 +599,18 @@ def get_normalized_event_weights(all_raw_weights: Dict[str, Dict[str, Any]], all
     fnames = list(all_raw_weights.keys())
     if not fnames:
         return {}
-        
+
     global_n_jets = np.concatenate([all_n_jets[f] for f in fnames], axis=0)
     global_event_weights = {}
-    
+
     # Identify keys to process (variation weights)
     weight_keys = [k for k in all_raw_weights[fnames[0]].keys() if isinstance(all_raw_weights[fnames[0]][k], np.ndarray) and any(x in k for x in ['nom', 'up', 'down', 'vars'])]
-    
+
     for key in weight_keys:
         raw_jet_w = np.concatenate([all_raw_weights[f][key] for f in fnames], axis=0)
         # 1. Unflatten to Event Weights
         evt_w = unflatten_event_weights(raw_jet_w, global_n_jets)
-        
+
         # 2. Normalize Event Weights to mean 1.0 (ONLY for events that have jets!)
         mask = global_n_jets > 0
         evt_w_norm = np.copy(evt_w)
@@ -587,7 +618,7 @@ def get_normalized_event_weights(all_raw_weights: Dict[str, Dict[str, Any]], all
             mean_w = np.mean(evt_w[mask], axis=0, keepdims=True) if evt_w.ndim == 2 else np.mean(evt_w[mask])
             norm_factor = 1.0 / mean_w
             evt_w_norm[mask] = evt_w[mask] * norm_factor
-        
+
         global_event_weights[key] = evt_w_norm
 
     # Split back into per-file dictionaries
@@ -599,17 +630,17 @@ def get_normalized_event_weights(all_raw_weights: Dict[str, Dict[str, Any]], all
         for key in weight_keys:
             all_event_weights[f][key] = global_event_weights[key][current_evt_idx : current_evt_idx + num_evts]
         current_evt_idx += num_evts
-        
+
     return all_event_weights
 
 # ==============================================================================
 # 8. Scale Factor and Uncertainty (Pass 4)
 # ==============================================================================
 
-def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], tau21_cut: float) -> Dict[str, Any]:
+def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], all_gen_weights: Dict[str, np.ndarray], tau21_cut: float) -> Dict[str, Any]:
     """
-    Computes global efficiency, scale factors, and uncertainties using RAW JET-LEVEL weights.
-    Normalization factors cancel out in the SF (efficiency ratio).
+    Computes global efficiency, scale factors, and uncertainties using RAW JET-LEVEL weights
+    multiplied by generator-level event weights.
     """
     print("\n[Pass 4] Calculating global Jet Scale Factor and uncertainties...")
     fnames = list(all_raw_weights.keys())
@@ -617,7 +648,7 @@ def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: D
         return {}
 
     global_jets = np.concatenate([all_jets[f] for f in fnames], axis=0)
-    nom_mc_weights = np.ones(len(global_jets)) # Base weights for MC
+    nom_mc_weights = np.concatenate([all_gen_weights[f] for f in fnames], axis=0)
 
     # Concatenate raw LP weights for global calculation
     global_LP_weights = {}
@@ -629,9 +660,15 @@ def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: D
             for f in fnames:
                 global_LP_weights[key].extend(all_raw_weights[f][key])
 
-    # Base MC is unweighted (nom_mc_weights = 1)
     # The LJP weights in global_LP_weights are raw (not normalized).
-    # Normalization cancels in eff_rw / eff_nom.
+    # We multiply them by generator weights to get the total MC weighted yield.
+    for key in global_LP_weights.keys():
+        if "nom" in key or "up" in key or "down" in key or "vars" in key:
+            if isinstance(global_LP_weights[key], np.ndarray):
+                if global_LP_weights[key].ndim == 2:
+                    global_LP_weights[key] *= nom_mc_weights[:, np.newaxis]
+                else:
+                    global_LP_weights[key] *= nom_mc_weights
 
     print(f"Average Bad Match Fraction: {np.mean(global_LP_weights.get('bad_match', [0])):.3f}")
 
@@ -704,6 +741,7 @@ def parse_arguments():
     parser.add_argument("--pfcand", type=str, default="PFCand", help="Branch name for PF Candidates.")
     parser.add_argument("--genpart", type=str, default="GenPart", help="Branch name for Generator-level particles.")
     parser.add_argument("--fatjet_pfcand", type=str, default="FatJetPFCand", help="Branch name mapping FatJets to PFCands.")
+    parser.add_argument("--genweight", type=str, default="genWeight", help="Branch name for generator-level event weight.")
     parser.add_argument("--max_process_jets", type=int, default=1000, help="Maximum jets to extract per file. Use a negative value to process all.")
     parser.add_argument("--min_pt", type=float, default=400.0, help="Minimum transverse momentum cut for jets.")
     parser.add_argument("--tau21_cut", type=float, default=0.4, help="Tau21 substructure cut to evaluate for the SF.")
@@ -711,6 +749,7 @@ def parse_arguments():
     parser.add_argument("--workers", type=int, default=16, help="Number of parallel workers for processing.")
     parser.add_argument("--topology", type=str, choices=["b2b", "boost"], default="b2b",
                         help="Jet topology: 'b2b' (ttbar-like, no cross-matching) or 'boost' (H->4q like, pool matching).")
+    parser.add_argument("--w_max", type=float, default=10.0, help="Maximum weight allowed for clipping to remove outliers.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for toy variations.")
 
     args = parser.parse_args()
@@ -731,7 +770,7 @@ def main(args):
         sys.exit(1)
 
     print("\nInitializing LundReweighter...")
-    LP_rw = LundReweighter(f_ratio=f_ratio)
+    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
 
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -754,6 +793,7 @@ def main(args):
     all_raw_weights = {}
     all_jets = {}
     all_n_jets = {}
+    all_gen_weights = {}
 
     # Pass 2: Raw Weights (Multiprocessing)
     print(f"\n[Pass 2] Computing raw Lund Plane weights (using {args.workers} workers)...")
@@ -761,12 +801,13 @@ def main(args):
         futures = {executor.submit(worker_pass2, fpath, args.ratio, args, triggers, rand_noise, pt_rand_noise, dist_contents): fpath for fpath in args.inputs}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             fpath = futures[future]
-            fpath_res, raw_weights, jets, n_jets_per_evt = future.result()
+            fpath_res, raw_weights, jets, n_jets_per_evt, gen_w = future.result()
             print(f"  -> Pass 2 finished for {fpath_res} ({i+1}/{len(args.inputs)})")
             if len(jets) > 0 and raw_weights:
                 all_raw_weights[fpath_res] = raw_weights
                 all_jets[fpath_res] = jets
                 all_n_jets[fpath_res] = n_jets_per_evt
+                all_gen_weights[fpath_res] = gen_w
 
     if not all_raw_weights:
         print("\nPipeline aborted: No matching jets passed in any input file.")
@@ -777,8 +818,8 @@ def main(args):
     all_event_weights = get_normalized_event_weights(all_raw_weights, all_n_jets)
 
     # Pass 4: Final SF and Uncertainties
-    # These are calculated using raw jet-level weights.
-    _ = calculate_sf_and_unc(all_raw_weights, all_jets, args.tau21_cut)
+    # These are calculated using raw jet-level weights multiplied by gen weights.
+    _ = calculate_sf_and_unc(all_raw_weights, all_jets, all_gen_weights, args.tau21_cut)
 
     f_ratio.Close()
 

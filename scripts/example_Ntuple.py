@@ -16,6 +16,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import uuid
 import shutil
 import concurrent.futures
+import importlib
 
 import numpy as np
 import awkward as ak
@@ -170,6 +171,7 @@ def process_inputs(
     genpart_branch: str = "GenPart",
     fatjet_pfcand_branch: str = "FatJetPFCand",
     genweight_branch: str = "genWeight",
+    features: List[str] = ["tau1", "tau2"],
     max_process_jets: int = 5000,
     jet_min_pt: float = 400.0,
     triggers: Optional[List[str]] = None,
@@ -289,14 +291,13 @@ def process_inputs(
             continue
 
         for jet, matched_q in zip(matched_jets_in_event, matched_quarks_in_event):
-            # Extract Jet features
-            eps = 1e-6
-            tau21 = getattr(jet, "tau2", 0) / (getattr(jet, "tau1", 0) + eps)
-            pnet_xqq = getattr(jet, "particleNetLegacy_Xqq", -1.0)
+            jet_data = [
+                jet.pt, jet.eta, jet.phi, getattr(jet, "msoftdrop", 0)
+            ]
+            for feat in features:
+                jet_data.append(getattr(jet, feat, 0))
 
-            jets_list.append([
-                jet.pt, jet.eta, jet.phi, getattr(jet, "msoftdrop", 0), tau21, pnet_xqq
-            ])
+            jets_list.append(jet_data)
 
             # The full 6 slots standard for the output
             full_quarks = [q1a, q1b, b1, q2a, q2b, b2]
@@ -346,7 +347,7 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return None
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
         h_lp_signal = LP_rw.h_mc.Clone(f"h_lp_signal_{worker_id}")
         h_lp_signal.Reset()
 
@@ -362,6 +363,7 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             genpart_branch=args.genpart,
             fatjet_pfcand_branch=args.fatjet_pfcand,
             genweight_branch=args.genweight,
+            features=args.features,
             max_process_jets=args.max_process_jets,
             jet_min_pt=args.min_pt,
             triggers=triggers,
@@ -527,7 +529,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return fpath, {}, np.array([]), np.array([])
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
 
         # Reconstruct h_distortion_ratio from contents
         h_distortion_ratio = LP_rw.h_mc.Clone(f"h_dist_{worker_id}")
@@ -547,6 +549,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
             genpart_branch=args.genpart,
             fatjet_pfcand_branch=args.fatjet_pfcand,
             genweight_branch=args.genweight,
+            features=args.features,
             max_process_jets=args.max_process_jets,
             jet_min_pt=args.min_pt,
             triggers=triggers,
@@ -629,7 +632,7 @@ def get_normalized_event_weights(all_raw_weights: Dict[str, Dict[str, Any]], all
 # 8. Scale Factor and Uncertainty (Pass 4)
 # ==============================================================================
 
-def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], all_gen_weights: Dict[str, np.ndarray], tau21_cut: float) -> Dict[str, Any]:
+def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], all_gen_weights: Dict[str, np.ndarray], selection_func: Any) -> Dict[str, Any]:
     """
     Computes global efficiency, scale factors, and uncertainties using RAW JET-LEVEL weights
     multiplied by generator-level event weights.
@@ -664,8 +667,7 @@ def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: D
 
     print(f"Average Bad Match Fraction: {np.mean(global_LP_weights.get('bad_match', [0])):.3f}")
 
-    tau21 = global_jets[:, 4]
-    score_cut = tau21 < tau21_cut
+    score_cut = selection_func(global_jets)
 
     eff_nom = np.average(score_cut, weights=nom_mc_weights)
     eff_rw = np.average(score_cut, weights=global_LP_weights["nom"])
@@ -736,7 +738,12 @@ def parse_arguments():
     parser.add_argument("--genweight", type=str, default="genWeight", help="Branch name for generator-level event weight.")
     parser.add_argument("--max_process_jets", type=int, default=1000, help="Maximum jets to extract per file. Use a negative value to process all.")
     parser.add_argument("--min_pt", type=float, default=400.0, help="Minimum transverse momentum cut for jets.")
-    parser.add_argument("--tau21_cut", type=float, default=0.4, help="Tau21 substructure cut to evaluate for the SF.")
+    parser.add_argument("--features", type=str, nargs="+", default=["tau1", "tau2"],
+                        help="List of additional jet features to extract (e.g. tau1 tau2).")
+    parser.add_argument("--selection_func", type=str, default="tau21_selections",
+                        help="Name of the selection function in scripts/selections.py.")
+    parser.add_argument("--triggers", type=str, nargs="+", default=["HLT_PFJet500"],
+                        help="List of trigger branch names.")
     parser.add_argument("--chunk_size", type=int, default=5000, help="Number of jets to process simultaneously to save memory.")
     parser.add_argument("--workers", type=int, default=16, help="Number of parallel workers for processing.")
     parser.add_argument("--topology", type=str, choices=["b2b", "boost"], default="b2b",
@@ -762,7 +769,7 @@ def main(args):
         sys.exit(1)
 
     print("\nInitializing LundReweighter...")
-    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
+    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
 
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -771,8 +778,7 @@ def main(args):
     rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsX(), LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ()))
     pt_rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ(), 3))
 
-    # triggers = ["HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450", "HLT_PFJet500"]
-    triggers = ["HLT_PFJet500"]
+    triggers = args.triggers
 
     # Pass 1: Global Distortion
     h_distortion_ratio = get_global_distortion(args.inputs, LP_rw, args, triggers)
@@ -812,7 +818,14 @@ def main(args):
 
     # Pass 4: Final SF and Uncertainties
     # These are calculated using raw jet-level weights multiplied by gen weights.
-    _ = calculate_sf_and_unc(all_raw_weights, all_jets, all_gen_weights, args.tau21_cut)
+    # Load the selection function from selections.py
+    try:
+        selections_mod = importlib.import_module("selections")
+        selection_func = getattr(selections_mod, args.selection_func)
+    except (ImportError, AttributeError) as e:
+        print(f"Error: Could not load selection function '{args.selection_func}' from scripts/selections.py: {e}")
+        sys.exit(1)
+    _ = calculate_sf_and_unc(all_raw_weights, all_jets, all_gen_weights, selection_func)
 
     f_ratio.Close()
 

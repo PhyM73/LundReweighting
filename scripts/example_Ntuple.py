@@ -98,12 +98,7 @@ def extract_gen_particles(event: Event, genpart_branch: str = "GenPart", verbose
     top_ID, W_ID, B_ID = 6, 24, 5
     MAXLEP_ID = 16
 
-    try:
-        GenPartsColl = Collection(event, genpart_branch)
-    except RuntimeError:
-        if verbose:
-            print(f"Warning: Branch '{genpart_branch}' not found in event.")
-        return (None,) * 10
+    GenPartsColl = Collection(event, genpart_branch)
 
     top = anti_top = W = anti_W = None
     q1a = q1b = b1 = q2a = q2b = b2 = None
@@ -159,12 +154,8 @@ def apply_selections(inTree: InputTree, triggers: Optional[List[str]] = None) ->
 
     pass_trigger = False
     for trig in triggers:
-        try:
-            # Using logical OR across triggers
-            pass_trigger = pass_trigger or inTree.readBranch(trig)
-        except RuntimeError:
-            # Branch might not exist
-            pass
+        # Using logical OR across triggers
+        pass_trigger = pass_trigger or inTree.readBranch(trig)
 
     return pass_trigger
 
@@ -230,12 +221,9 @@ def process_inputs(
         except RuntimeError:
             event_weight = 1.0
 
-        try:
-            AK8Jets = Collection(event, fatjet_branch)
-            PFCands = Collection(event, pfcand_branch)
-            FatJetPFCands = Collection(event, fatjet_pfcand_branch)
-        except RuntimeError:
-            continue
+        AK8Jets = Collection(event, fatjet_branch)
+        PFCands = Collection(event, pfcand_branch)
+        FatJetPFCands = Collection(event, fatjet_pfcand_branch)
 
         if len(AK8Jets) == 0 or AK8Jets[0].pt < jet_min_pt:
             continue
@@ -254,7 +242,14 @@ def process_inputs(
         matched_quarks_in_event = []
 
         for i, jet in enumerate(AK8Jets):
-            jet.idx = i
+            # Smart indexing: Use existing 'idx' if present (e.g. from pre-filtered Ntuples),
+            # otherwise use the current collection index.
+            if "idx" not in vars(jet):
+                try:
+                    _ = jet.idx
+                except Exception:
+                    jet.idx = i
+
             if jet.pt > jet_min_pt and abs(jet.eta) < 2.4:
                 # Selection based on topology
                 if topology == "boost":
@@ -351,7 +346,7 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return None
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
         h_lp_signal = LP_rw.h_mc.Clone(f"h_lp_signal_{worker_id}")
         h_lp_signal.Reset()
 
@@ -428,11 +423,8 @@ def get_global_distortion(inputs: List[str], LP_rw_global: Any, args: Any, trigg
     h_dummy.Reset()
     h_distortion_ratio = LP_rw_global.make_LP_ratio(LP_rw_global.h_mc, h_dummy, h_lp_signal_global)
 
-    try:
-        from utils.LundReweighter import cleanup_ratio
-        cleanup_ratio(h_distortion_ratio, h_min=0.2, h_max=5.0)
-    except ImportError:
-        pass
+    from utils.LundReweighter import cleanup_ratio
+    cleanup_ratio(h_distortion_ratio, h_min=0.2, h_max=5.0)
 
     return h_distortion_ratio
 
@@ -535,7 +527,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return fpath, {}, np.array([]), np.array([])
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
 
         # Reconstruct h_distortion_ratio from contents
         h_distortion_ratio = LP_rw.h_mc.Clone(f"h_dist_{worker_id}")
@@ -770,7 +762,7 @@ def main(args):
         sys.exit(1)
 
     print("\nInitializing LundReweighter...")
-    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True)
+    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=True, pf_pt_min=1.0)
 
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -779,7 +771,8 @@ def main(args):
     rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsX(), LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ()))
     pt_rand_noise = np.random.normal(size=(nToys, LP_rw.h_ratio.GetNbinsY(), LP_rw.h_ratio.GetNbinsZ(), 3))
 
-    triggers = ["HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450", "HLT_PFJet500"]
+    # triggers = ["HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450", "HLT_PFJet500"]
+    triggers = ["HLT_PFJet500"]
 
     # Pass 1: Global Distortion
     h_distortion_ratio = get_global_distortion(args.inputs, LP_rw, args, triggers)

@@ -16,6 +16,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import uuid
 import shutil
 import concurrent.futures
+import pickle
 import importlib
 
 import numpy as np
@@ -204,8 +205,7 @@ def process_inputs(
     inTree = InputTree(TTree)
 
     n_selected_jets = 0
-    n_events_evaluated = 0
-    n_jets_per_event = []
+    n_jets_per_event = [0 for i in range(inTree.entries)]
     jets_list = []
     quarks_list = []
     cands_list = []
@@ -284,9 +284,7 @@ def process_inputs(
                     if not source1_active and not source2_active:
                         break # Both decay chains consumed
 
-        n_events_evaluated += 1
-        n_jets_per_event.append(len(matched_jets_in_event))
-
+        n_jets_per_event[entry] = len(matched_jets_in_event)
         if len(matched_jets_in_event) == 0:
             continue
 
@@ -624,7 +622,118 @@ def get_normalized_event_weights(all_raw_weights: Dict[str, Dict[str, Any]], all
     return all_event_weights
 
 # ==============================================================================
-# 8. Scale Factor and Uncertainty (Pass 4)
+# 8. Write-Out Methods
+# ==============================================================================
+
+def save_event_weights(
+    all_event_weights: Dict[str, Dict[str, np.ndarray]],
+    output_dir: str,
+    output_name: str,
+    input_files: List[str],
+    workers: int = 16
+) -> None:
+    """
+    Saves normalized event-level weights in two formats:
+      1. A single pickle file containing all event weights keyed by filename.
+      2. New branches written back into each input ROOT file's Events tree.
+
+    Args:
+        all_event_weights: Per-file dict of {weight_key: np.ndarray} from get_normalized_event_weights.
+        output_dir: Directory for pickle output.
+        output_name: Pickle filename.
+        input_files: Original input ROOT file paths.
+        workers: Number of parallel workers for ROOT write-back.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    pickle_path = os.path.join(output_dir, f"{output_name}.pickle")
+    with open(pickle_path, "wb") as f:
+        pickle.dump(all_event_weights, f)
+    print(f"  -> Saved event weights to {pickle_path}")
+
+    files_to_write = [f for f in input_files if f in all_event_weights]
+    n_workers = min(workers, len(files_to_write))
+    if not files_to_write:
+        print("  -> No matching input files for ROOT write-back, skipping.")
+        return
+    else:
+        print(f"  -> Writing weights back to {len(files_to_write)} ROOT file(s) (using {n_workers} workers)...")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(write_weights_to_root, fpath, all_event_weights[fpath]): fpath
+            for fpath in files_to_write
+        }
+        for future in concurrent.futures.as_completed(futures):
+            fpath = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"     Error writing to {fpath}: {e}")
+
+
+def write_weights_to_root(fpath: str, event_weights: Dict[str, np.ndarray]) -> None:
+    """
+    Writes normalized event-level LJP weights as new branches into an existing
+    ROOT file's Events tree. Each weight key becomes a new branch prefixed with 'LJP_'.
+
+    Args:
+        fpath: Path to the ROOT file.
+        event_weights: Dict of {key: np.ndarray} of per-event weights.
+
+    Returns:
+        A status message string.
+    """
+    import array
+
+    f = ROOT.TFile.Open(fpath, "UPDATE")
+    if not f or f.IsZombie():
+        raise IOError(f"FAILED: Could not open {fpath} for UPDATE")
+
+    tree = f.Get("Events")
+    if not tree:
+        f.Close()
+        raise ValueError(f"FAILED: No 'Events' tree in {fpath}")
+
+    n_entries = tree.GetEntries()
+
+    # Determine which keys are 1D vs 2D (e.g. stat_vars, pt_vars)
+    branches = {}
+    buffers = {}
+    for key, vals in event_weights.items():
+        if vals.ndim == 1:
+            branch_name = f"weight_LJP_{key.replace('nom', 'nominal')}"
+            buf = array.array('f', [0.0])
+            branches[key] = tree.Branch(branch_name, buf, f"{branch_name}/F")
+            buffers[key] = buf
+        elif vals.ndim == 2:
+            n_vars = vals.shape[1]
+            branch_name = f"weight_LJP_{key}"
+            buf = array.array('f', [0.0] * n_vars)
+            branches[key] = tree.Branch(branch_name, buf, f"{branch_name}[{n_vars}]/F")
+            buffers[key] = buf
+
+    n_weights = len(next(iter(event_weights.values())))
+    if n_weights != n_entries:
+        f.Close()
+        raise ValueError(f"FAILED: Weight array length ({n_weights}) does not match "
+                         f"number of entries ({n_entries}) in {fpath}")
+
+    for i in range(n_entries):
+        for key, buf in buffers.items():
+            vals = event_weights[key]
+            if vals.ndim == 1:
+                buf[0] = float(vals[i])
+            else:
+                for j in range(vals.shape[1]):
+                    buf[j] = float(vals[i, j])
+        for b in branches.values():
+            b.Fill()
+
+    tree.Write("", ROOT.TObject.kOverwrite)
+    f.Close()
+
+# ==============================================================================
+# 9. Scale Factor and Uncertainty (Pass 4)
 # ==============================================================================
 
 def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: Dict[str, np.ndarray], all_gen_weights: Dict[str, np.ndarray], selection_func: Any) -> Dict[str, Any]:
@@ -836,6 +945,20 @@ def parse_arguments():
         help="Random seed for statistical and pT extrapolation toy variations."
     )
 
+    # -- Output Configuration -----------------------------------------------
+    output_group = parser.add_argument_group(
+        "Output Configuration",
+        "Paths and filenames for saving results."
+    )
+    output_group.add_argument(
+        "--output_dir", type=str, default="output",
+        help="Directory to save output files."
+    )
+    output_group.add_argument(
+        "--output_name", type=str, default="all_event_weights",
+        help="Base name for the pickled event weights."
+    )
+
     args = parser.parse_args()
 
     # Adjust workers to not exceed the number of input files
@@ -900,6 +1023,7 @@ def main(args):
     # Pass 3: Normalized Event Weights for MC Calibration
     # These are the weights to use when filling histograms of event-level observables.
     all_event_weights = get_normalized_event_weights(all_raw_weights, all_n_jets)
+    save_event_weights(all_event_weights, args.output_dir, args.output_name, args.inputs, args.workers)
 
     # Pass 4: Final SF and Uncertainties
     # These are calculated using raw jet-level weights multiplied by gen weights.

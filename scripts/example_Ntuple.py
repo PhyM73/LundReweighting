@@ -118,10 +118,10 @@ def extract_gen_particles(event: Event, genpart_branch: str = "GenPart", verbose
     # Second pass: Find quarks from W and top decays
     for genPart in GenPartsColl:
         m = genPart.genPartIdxMother
-        mother = GenPartsColl[m] if m >= 0 else None
+        mother = GenPartsColl[m] if m > 0 else None
 
         # Quarks/leptons from W decay (handles ttbar, tW, WW)
-        if abs(genPart.pdgId) <= MAXLEP_ID and m >= 0:
+        if abs(genPart.pdgId) <= MAXLEP_ID and m > 0:
             if mother is W:
                 if genPart.pdgId > 0: q1a = genPart if q1a is None else q1a
                 else: q1b = genPart if q1b is None else q1b
@@ -130,7 +130,7 @@ def extract_gen_particles(event: Event, genpart_branch: str = "GenPart", verbose
                 else: q2b = genPart if q2b is None else q2b
 
         # b quarks from top decay
-        if abs(genPart.pdgId) == B_ID and m >= 0:
+        if abs(genPart.pdgId) == B_ID and m > 0:
             if mother is top: b1 = genPart if b1 is None else b1
             elif mother is anti_top: b2 = genPart if b2 is None else b2
 

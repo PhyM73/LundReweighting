@@ -91,10 +91,10 @@ def get_ttbar_gen_parts(event, verbose=True):
     for genPart in GenPartsColl:
         # Find quarks or leptons from W decay
         m = genPart.genPartIdxMother
-        mother = GenPartsColl[m] if m >= 0 else None
+        mother = GenPartsColl[m] if m > 0 else None
         w_mother_match = mother is W
         anti_w_mother_match = mother is anti_W
-        if abs(genPart.pdgId) <= MAXLEP_ID and m >= 0 and w_mother_match:
+        if abs(genPart.pdgId) <= MAXLEP_ID and m > 0 and w_mother_match:
             if genPart.pdgId > 0:
                 if fermion1 is None:
                     fermion1 = genPart
@@ -106,7 +106,7 @@ def get_ttbar_gen_parts(event, verbose=True):
                 elif verbose:
                     print("WARNING : Extra anti quark ? ")
 
-        elif abs(genPart.pdgId) <= MAXLEP_ID and m >= 0 and anti_w_mother_match:
+        elif abs(genPart.pdgId) <= MAXLEP_ID and m > 0 and anti_w_mother_match:
             if genPart.pdgId > 0:
                 if fermion2 is None:
                     fermion2 = genPart

@@ -305,7 +305,7 @@ class LundReweighter():
                     if(len(cs_CA) > 0):
                         CA_cs = fj.ClusterSequence(cs_CA, CA_jet_def)
                         CA_jet = fj.sorted_by_pt(CA_cs.inclusive_jets())
-                        js_new.append(CA_jets[0])
+                        js_new.append(CA_jet[0])
                         clust_seqs.append(CA_cs) #prevent from going out of scope
 
                 js = js_new

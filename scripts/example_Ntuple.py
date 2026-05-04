@@ -347,7 +347,7 @@ def worker_pass1(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return None
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=args.use_ca, pf_pt_min=1.0)
         h_lp_signal = LP_rw.h_mc.Clone(f"h_lp_signal_{worker_id}")
         h_lp_signal.Reset()
 
@@ -524,7 +524,7 @@ def worker_pass2(fpath: str, ratio_file_path: str, args: Any, triggers: List[str
         if not f_ratio or f_ratio.IsZombie():
             return fpath, {}, np.array([]), np.array([])
 
-        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
+        LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=args.use_ca, pf_pt_min=1.0)
 
         # Reconstruct h_distortion_ratio from contents
         h_distortion_ratio = LP_rw.h_mc.Clone(f"h_dist_{worker_id}")
@@ -719,31 +719,122 @@ def calculate_sf_and_unc(all_raw_weights: Dict[str, Dict[str, Any]], all_jets: D
 
 def parse_arguments():
     """
-    Parses command line arguments.
+    Parses command line arguments for the Lund Jet Plane reweighting pipeline.
     """
-    parser = argparse.ArgumentParser(description="Run Lund Jet Plane Reweighting on Ntuple/NanoAOD files.")
-    parser.add_argument("--inputs", nargs="+", default=["/t3home/fameng/work/BosonRes/CMSSW_14_1_9/src/LundReweighting/013c4b44-92a8-42a8-ac27-c127158c4726.root"],
-                        help="List of paths to the signal ROOT files.")
-    parser.add_argument("--ratio", type=str, default="data/ratio_2018.root",
-                        help="Path to the Lund Plane ratio correction ROOT file.")
-    parser.add_argument("--fatjet", type=str, default="FatJet", help="Branch name for FatJets.")
-    parser.add_argument("--pfcand", type=str, default="PFCand", help="Branch name for PF Candidates.")
-    parser.add_argument("--genpart", type=str, default="GenPart", help="Branch name for Generator-level particles.")
-    parser.add_argument("--fatjet_pfcand", type=str, default="FatJetPFCand", help="Branch name mapping FatJets to PFCands.")
-    parser.add_argument("--genweight", type=str, default="genWeight", help="Branch name for generator-level event weight.")
-    parser.add_argument("--max_process_jets", type=int, default=1000, help="Maximum jets to extract per file. Use a negative value to process all.")
-    parser.add_argument("--min_pt", type=float, default=400.0, help="Minimum transverse momentum cut for jets.")
-    parser.add_argument("--features", type=str, nargs="+", default=["tau1", "tau2"],
-                        help="List of additional jet features to extract (e.g. tau1 tau2).")
-    parser.add_argument("--selection_func", type=str, default="tau21_selections",
-                        help="Name of the selection function in scripts/selections.py.")
-    parser.add_argument("--triggers", type=str, nargs="+", default=["HLT_PFJet500","HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450"],
-                        help="List of trigger branch names.")
-    parser.add_argument("--chunk_size", type=int, default=5000, help="Number of jets to process simultaneously to save memory.")
-    parser.add_argument("--workers", type=int, default=16, help="Number of parallel workers for processing.")
-    parser.add_argument("--topology", type=str, choices=["b2b", "boost"], default="b2b",
-                        help="Jet topology: 'b2b' (ttbar-like, no cross-matching) or 'boost' (H->4q like, pool matching).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for toy variations.")
+    class _Formatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+        pass
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Lund Jet Plane (LJP) reweighting pipeline for NanoAOD/Ntuple files.\n"
+            "Computes per-jet correction weights derived from data/MC Lund plane\n"
+            "density ratios (JME-23-001), and evaluates a jet substructure scale\n"
+            "factor with full systematic uncertainties."
+        ),
+        formatter_class=_Formatter,
+        epilog=(
+            "Examples:\n"
+            "  # ttbar-like topology (default):\n"
+            "  python %(prog)s --inputs file.root --ratio data/ratio_2018.root\n\n"
+            "  # Boosted H->WW->4q with CA splittings:\n"
+            "  python %(prog)s --inputs signal.root --topology boost --use_ca\n"
+        ),
+    )
+
+    # -- Input Configuration ------------------------------------------------
+    input_group = parser.add_argument_group(
+        "Input Configuration",
+        "Paths to input files and ROOT branch names."
+    )
+    input_group.add_argument(
+        "--inputs", nargs="+",
+        default=["013c4b44-92a8-42a8-ac27-c127158c4726.root"],
+        help="Paths to one or more signal ROOT files to process."
+    )
+    input_group.add_argument(
+        "--ratio", type=str, default="data/ratio_2018.root",
+        help="Path to the Lund Plane data/MC ratio correction ROOT file."
+    )
+    input_group.add_argument(
+        "--fatjet", type=str, default="FatJet",
+        help="Branch name for AK8 FatJets."
+    )
+    input_group.add_argument(
+        "--pfcand", type=str, default="PFCand",
+        help="Branch name for PF Candidates."
+    )
+    input_group.add_argument(
+        "--genpart", type=str, default="GenPart",
+        help="Branch name for generator-level particles."
+    )
+    input_group.add_argument(
+        "--fatjet_pfcand", type=str, default="FatJetPFCand",
+        help="Branch name mapping FatJets to PFCands."
+    )
+    input_group.add_argument(
+        "--genweight", type=str, default="genWeight",
+        help="Branch name for generator-level event weight."
+    )
+    input_group.add_argument(
+        "--features", type=str, nargs="+", default=["tau1", "tau2"],
+        help="Additional jet features to extract (e.g. tau1 tau2 particleNet_XbbVsQCD)."
+    )
+    input_group.add_argument(
+        "--triggers", type=str, nargs="+",
+        default=["HLT_PFJet500", "HLT_PFHT890", "HLT_PFHT1050", "HLT_PFJet450"],
+        help="Trigger branch names for event preselection (logical OR)."
+    )
+
+    # -- Analysis Configuration ---------------------------------------------
+    analysis_group = parser.add_argument_group(
+        "Analysis Configuration",
+        "Physics options controlling the LJP reweighting and jet selection."
+    )
+    analysis_group.add_argument(
+        "--topology", type=str, choices=["b2b", "boost"], default="b2b",
+        help=(
+            "Jet-quark matching topology. "
+            "'b2b': Back-to-back. Match quarks within each top decay chain separately (ttbar-like). "
+            "'boost': Boost. Pool all quarks and match any >=2 to a jet (H->4q like)."
+        )
+    )
+    analysis_group.add_argument(
+        "--min_pt", type=float, default=400.0,
+        help="Minimum jet pT threshold [GeV]."
+    )
+    analysis_group.add_argument(
+        "--max_process_jets", type=int, default=1000,
+        help="Maximum jets to extract per input file. Use -1 to process all."
+    )
+    analysis_group.add_argument(
+        "--selection_func", type=str, default="tau21_selections",
+        help="Name of the selection function (defined in scripts/selections.py) used to evaluate the SF."
+    )
+    analysis_group.add_argument(
+        "--use_ca", action="store_true", default=False,
+        help=(
+            "Re-cluster each kT subjet with the Cambridge-Aachen algorithm to obtain "
+            "the splitting tree. If not set, the kT clustering history is used directly."
+        )
+    )
+
+    # -- Execution Configuration --------------------------------------------
+    exec_group = parser.add_argument_group(
+        "Execution Configuration",
+        "Runtime parameters for parallelism, memory, and reproducibility."
+    )
+    exec_group.add_argument(
+        "--workers", type=int, default=16,
+        help="Number of parallel workers for multiprocessing (capped to number of input files)."
+    )
+    exec_group.add_argument(
+        "--chunk_size", type=int, default=5000,
+        help="Number of jets per chunk for weight computation (controls memory usage)."
+    )
+    exec_group.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for statistical and pT extrapolation toy variations."
+    )
 
     args = parser.parse_args()
 
@@ -763,7 +854,7 @@ def main(args):
         sys.exit(1)
 
     print("\nInitializing LundReweighter...")
-    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=False, pf_pt_min=1.0)
+    LP_rw = LundReweighter(f_ratio=f_ratio, use_CA=args.use_ca, pf_pt_min=1.0)
 
     if args.seed is not None:
         np.random.seed(args.seed)

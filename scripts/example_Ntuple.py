@@ -235,7 +235,7 @@ def process_inputs(
         _, _, _, _, q1a, q1b, b1, q2a, q2b, b2 = gen_parts
 
         # Pool of potential quarks for matching
-        potential_quarks_evt = [q1a, q1b, q2a, q2b] # Copy for the event
+        potential_quarks_evt = [q1a, q1b, q2a, q2b, b1, b2] # Copy for the event
         source1_active = True
         source2_active = True
 

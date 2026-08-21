@@ -1,4 +1,4 @@
-# Code for the Lund Jet Plane Reweighting Method (JME-23-001)
+# Code for the Lund Jet Plane Reweighting Method ([arXiv:2507.07775](https://arxiv.org/abs/2507.07775)JME-23-001)
 
 For those seeking to just use the Lund Plane ratio for their analysis,
 I recommend to look at the at the **`example.py` and `example_NanoV15.py`** scripts.
